@@ -1,11 +1,10 @@
-use std::marker::PhantomData;
-use std::task::{Context, Poll};
+use std::{fmt, marker::PhantomData, task::Context, task::Poll};
 
 use ntex::service::{Service, ServiceFactory};
 use ntex::util::Ready;
 
-use super::control::{ControlMessage, ControlResult};
-use super::publish::PublishMessage;
+use super::control::{ControlMessage, ControlResult, ControlResultKind};
+use super::publish::Publish;
 use super::Session;
 
 /// Default publish service
@@ -21,7 +20,7 @@ impl<St, Err> Default for DefaultPublishService<St, Err> {
 
 impl<St, Err> ServiceFactory for DefaultPublishService<St, Err> {
     type Config = Session<St>;
-    type Request = PublishMessage;
+    type Request = Publish;
     type Response = ();
     type Error = Err;
     type Service = DefaultPublishService<St, Err>;
@@ -34,7 +33,7 @@ impl<St, Err> ServiceFactory for DefaultPublishService<St, Err> {
 }
 
 impl<St, Err> Service for DefaultPublishService<St, Err> {
-    type Request = PublishMessage;
+    type Request = Publish;
     type Response = ();
     type Error = Err;
     type Future = Ready<Self::Response, Self::Error>;
@@ -43,7 +42,7 @@ impl<St, Err> Service for DefaultPublishService<St, Err> {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&self, _: PublishMessage) -> Self::Future {
+    fn call(&self, _: Publish) -> Self::Future {
         log::warn!("Publish service is disabled");
         Ready::Ok(())
     }
@@ -58,9 +57,9 @@ impl<S, E> Default for DefaultControlService<S, E> {
     }
 }
 
-impl<S, E> ServiceFactory for DefaultControlService<S, E> {
+impl<S, E: fmt::Debug> ServiceFactory for DefaultControlService<S, E> {
     type Config = Session<S>;
-    type Request = ControlMessage;
+    type Request = ControlMessage<E>;
     type Response = ControlResult;
     type Error = E;
     type InitError = E;
@@ -72,8 +71,8 @@ impl<S, E> ServiceFactory for DefaultControlService<S, E> {
     }
 }
 
-impl<S, E> Service for DefaultControlService<S, E> {
-    type Request = ControlMessage;
+impl<S, E: fmt::Debug> Service for DefaultControlService<S, E> {
+    type Request = ControlMessage<E>;
     type Response = ControlResult;
     type Error = E;
     type Future = Ready<Self::Response, Self::Error>;
@@ -84,21 +83,17 @@ impl<S, E> Service for DefaultControlService<S, E> {
     }
 
     #[inline]
-    fn call(&self, subs: ControlMessage) -> Self::Future {
+    fn call(&self, pkt: Self::Request) -> Self::Future {
         log::warn!("MQTT Subscribe is not supported");
 
-        Ready::Ok(match subs {
+        Ready::Ok(match pkt {
             ControlMessage::Ping(ping) => ping.ack(),
             ControlMessage::Disconnect(disc) => disc.ack(),
-            ControlMessage::Subscribe(subs) => {
-                log::warn!("MQTT Subscribe is not supported");
-                subs.ack()
-            }
-            ControlMessage::Unsubscribe(unsubs) => {
-                log::warn!("MQTT Unsubscribe is not supported");
-                unsubs.ack()
-            }
             ControlMessage::Closed(msg) => msg.ack(),
+            _ => {
+                log::warn!("MQTT3 Control service is not configured, pkt: {:?}", pkt);
+                ControlResult { result: ControlResultKind::Disconnect }
+            }
         })
     }
 }

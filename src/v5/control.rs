@@ -220,7 +220,7 @@ impl<'a> Subscription<'a> {
     #[inline]
     /// subscription topic
     pub fn topic(&self) -> &'a ByteString {
-        &self.topic
+        self.topic
     }
 
     #[inline]
@@ -377,7 +377,7 @@ impl<'a> UnsubscribeItem<'a> {
     #[inline]
     /// subscription topic
     pub fn topic(&self) -> &'a ByteString {
-        &self.topic
+        self.topic
     }
 
     #[inline]
@@ -439,7 +439,7 @@ impl<E> Error<E> {
 
     #[inline]
     /// Returns reference to mqtt error
-    pub fn get_err(&self) -> &E {
+    pub fn get_ref(&self) -> &E {
         &self.err
     }
 
@@ -485,7 +485,7 @@ impl<E> Error<E> {
     }
 }
 
-/// Connection failed message
+/// Protocol level error
 #[derive(Debug)]
 pub struct ProtocolError {
     err: error::ProtocolError,
@@ -570,5 +570,17 @@ impl ProtocolError {
     /// Ack protocol error, return disconnect packet and close connection.
     pub fn ack(self) -> ControlResult {
         ControlResult { packet: Some(codec::Packet::Disconnect(self.pkt)), disconnect: true }
+    }
+
+    #[inline]
+    /// Ack protocol error, return disconnect packet and close connection.
+    pub fn ack_and_error(self) -> (ControlResult, error::ProtocolError) {
+        (
+            ControlResult {
+                packet: Some(codec::Packet::Disconnect(self.pkt)),
+                disconnect: true,
+            },
+            self.err,
+        )
     }
 }

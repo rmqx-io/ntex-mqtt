@@ -1,6 +1,6 @@
 use derive_more::{Display, From};
 use ntex::util::Either;
-use std::io;
+use std::{error, io};
 
 /// Errors which can occur when attempting to handle mqtt connection.
 #[derive(Debug)]
@@ -13,8 +13,8 @@ pub enum MqttError<E> {
     HandshakeTimeout,
     /// Peer disconnect
     Disconnected,
-    /// Protocol specific unhandled error (for v3.1.1 only)
-    V3ProtocolError,
+    /// Server error
+    ServerError(&'static str),
 }
 
 /// Protocol level errors
@@ -48,6 +48,8 @@ pub enum ProtocolError {
     #[display(fmt = "Unexpected io error: {}", _0)]
     Io(io::Error),
 }
+
+impl error::Error for ProtocolError {}
 
 impl<E> From<ProtocolError> for MqttError<E> {
     fn from(err: ProtocolError) -> Self {
@@ -98,6 +100,8 @@ pub enum DecodeError {
     Utf8Error(std::str::Utf8Error),
 }
 
+impl error::Error for DecodeError {}
+
 #[derive(Copy, Clone, Debug, Display, PartialEq, Eq, Hash)]
 pub enum EncodeError {
     InvalidLength,
@@ -105,6 +109,8 @@ pub enum EncodeError {
     PacketIdRequired,
     UnsupportedVersion,
 }
+
+impl error::Error for EncodeError {}
 
 impl PartialEq for DecodeError {
     fn eq(&self, other: &Self) -> bool {
@@ -137,7 +143,6 @@ pub enum SendPacketError {
     /// Peer disconnected
     #[display(fmt = "Peer disconnected")]
     Disconnected,
-    /// Timeout
-    #[display(fmt = "Timeout")]
-    Timeout,
 }
+
+impl error::Error for SendPacketError {}

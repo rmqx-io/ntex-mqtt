@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 use std::{convert::TryFrom, future::Future, io::Cursor, pin::Pin};
 
 use ntex::service::Service;
-use ntex::util::{Buf, BufMut, ByteString, Bytes, BytesMut};
+use ntex::util::{Buf, BufMut, ByteString, Bytes, BytesMut, Either};
 
 use crate::error::{DecodeError, EncodeError};
 
@@ -131,8 +131,9 @@ impl Decode for ByteString {
 }
 
 pub(crate) fn take_properties(src: &mut Bytes) -> Result<Bytes, DecodeError> {
-    let prop_len = if src.has_remaining() { decode_variable_length_cursor(src)? } else { 0 };
+    let prop_len = decode_variable_length_cursor(src)?;
     ensure!(src.remaining() >= prop_len as usize, DecodeError::InvalidLength);
+
     Ok(src.split_to(prop_len as usize))
 }
 
@@ -150,8 +151,7 @@ pub(crate) fn decode_variable_length_cursor<B: Buf>(src: &mut B) -> Result<u32, 
     let mut shift: u32 = 0;
     let mut len: u32 = 0;
     loop {
-        let has_remaining = src.has_remaining();
-        ensure!(has_remaining, DecodeError::MalformedPacket);
+        ensure!(src.has_remaining(), DecodeError::MalformedPacket);
         let val = src.get_u8();
         len += ((val & 0b0111_1111u8) as u32) << shift;
         if val & 0b1000_0000 == 0 {
@@ -319,6 +319,43 @@ impl<'a, S: Service> Future for Ready<'a, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.0.poll_ready(cx)
+    }
+}
+
+pub(crate) async fn select<F1, F2>(fut1: F1, fut2: F2) -> Either<F1::Output, F2::Output>
+where
+    F1: Future,
+    F2: Future,
+{
+    Select { fut1, fut2 }.await
+}
+
+pin_project_lite::pin_project! {
+    struct Select<F1, F2>{
+        #[pin]
+        fut1: F1,
+        #[pin]
+        fut2: F2
+    }
+}
+
+impl<F1, F2> Future for Select<F1, F2>
+where
+    F1: Future,
+    F2: Future,
+{
+    type Output = Either<F1::Output, F2::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        if let Poll::Ready(res) = this.fut1.poll(cx) {
+            Poll::Ready(Either::Left(res))
+        } else if let Poll::Ready(res) = this.fut2.poll(cx) {
+            Poll::Ready(Either::Right(res))
+        } else {
+            Poll::Pending
+        }
     }
 }
 

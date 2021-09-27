@@ -1,5 +1,4 @@
-use std::convert::TryFrom;
-use std::num::NonZeroU16;
+use std::{convert::TryFrom, mem, num::NonZeroU16};
 
 use ntex::router::Path;
 use ntex::util::{ByteString, Bytes};
@@ -8,49 +7,19 @@ use serde_json::Error as JsonError;
 
 use crate::v3::codec;
 
-#[derive(Debug)]
-pub enum PublishMessage {
-    /// Publish packet
-    Publish(Publish),
-    /// Publish acknowledgment packet
-    PublishAck(NonZeroU16),
-    ///Publish received packet
-    PublishReceived(NonZeroU16),
-    ///Publish complete packet
-    PublishComplete(NonZeroU16),
-}
-
-#[derive(Debug)]
-pub enum PublishResult {
-    PublishAck(Option<NonZeroU16>, codec::QoS),
-    PublishRelease(NonZeroU16),
-    Nothing,
-}
-
 /// Publish message
 pub struct Publish {
     publish: codec::Publish,
     topic: Path<ByteString>,
-    query: Option<ByteString>,
 }
+
+#[derive(Debug)]
+/// Publish ack
+pub struct PublishAck;
 
 impl Publish {
     pub(crate) fn new(publish: codec::Publish) -> Self {
-        let (topic, query) = if let Some(pos) = publish.topic.find('?') {
-            (
-                ByteString::try_from(publish.topic.as_bytes().slice(0..pos)).unwrap(),
-                Some(
-                    ByteString::try_from(
-                        publish.topic.as_bytes().slice(pos + 1..publish.topic.len()),
-                    )
-                    .unwrap(),
-                ),
-            )
-        } else {
-            (publish.topic.clone(), None)
-        };
-        let topic = Path::new(topic);
-        Self { publish, topic, query }
+        Self { topic: Path::new(publish.topic.clone()), publish }
     }
 
     #[inline]
@@ -93,11 +62,6 @@ impl Publish {
     }
 
     #[inline]
-    pub fn query(&self) -> &str {
-        self.query.as_ref().map(|s| s.as_ref()).unwrap_or("")
-    }
-
-    #[inline]
     pub fn packet(&self) -> &codec::Publish {
         &self.publish
     }
@@ -113,9 +77,9 @@ impl Publish {
         &self.publish.payload
     }
 
-    /// Extract Bytes from packet payload
-    pub fn take_payload(&self) -> Bytes {
-        self.publish.payload.clone()
+    /// Replace packet'a payload with empty bytes, returns existing payload.
+    pub fn take_payload(&mut self) -> Bytes {
+        mem::take(&mut self.publish.payload)
     }
 
     /// Loads and parse `application/json` encoded body.

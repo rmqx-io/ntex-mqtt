@@ -3,9 +3,9 @@ use std::{convert::TryFrom, num::NonZeroU16, time::Duration};
 
 use futures::{future::ok, FutureExt, SinkExt, StreamExt};
 use ntex::codec::Framed;
-use ntex::rt::time::delay_for;
 use ntex::server;
-use ntex::util::{ByteString, Bytes};
+use ntex::time::sleep;
+use ntex::util::{poll_fn, ByteString, Bytes};
 
 use ntex_mqtt::v5::{
     client, codec, error, ControlMessage, Handshake, HandshakeAck, MqttServer, Publish,
@@ -49,9 +49,6 @@ async fn handshake<Io>(packet: Handshake<Io>) -> Result<HandshakeAck<Io, St>, Te
 
 #[ntex::test]
 async fn test_simple() -> std::io::Result<()> {
-    std::env::set_var("RUST_LOG", "ntex_mqtt=trace,ntex_codec=info,ntex=trace");
-    env_logger::init();
-
     let srv = server::test_server(|| {
         MqttServer::new(handshake).publish(|p: Publish| ok::<_, TestError>(p.ack())).finish()
     });
@@ -76,11 +73,11 @@ async fn test_simple() -> std::io::Result<()> {
 async fn test_disconnect() -> std::io::Result<()> {
     let srv = server::test_server(|| {
         MqttServer::new(handshake)
-            .publish(ntex::fn_factory_with_config(|session: Session<St>| {
-                ok::<_, TestError>(ntex::fn_service(move |p: Publish| {
+            .publish(ntex::service::fn_factory_with_config(|session: Session<St>| {
+                ok::<_, TestError>(ntex::service::fn_service(move |p: Publish| {
                     session.sink().close();
                     async move {
-                        delay_for(Duration::from_millis(100)).await;
+                        sleep(Duration::from_millis(100)).await;
                         Ok::<_, TestError>(p.ack())
                     }
                 }))
@@ -107,15 +104,15 @@ async fn test_disconnect() -> std::io::Result<()> {
 async fn test_disconnect_with_reason() -> std::io::Result<()> {
     let srv = server::test_server(|| {
         MqttServer::new(handshake)
-            .publish(ntex::fn_factory_with_config(|session: Session<St>| {
-                ok::<_, TestError>(ntex::fn_service(move |p: Publish| {
+            .publish(ntex::service::fn_factory_with_config(|session: Session<St>| {
+                ok::<_, TestError>(ntex::service::fn_service(move |p: Publish| {
                     let pkt = codec::Disconnect {
                         reason_code: codec::DisconnectReasonCode::ServerMoved,
                         ..Default::default()
                     };
                     session.sink().close_with_reason(pkt);
                     async move {
-                        delay_for(Duration::from_millis(100)).await;
+                        sleep(Duration::from_millis(100)).await;
                         Ok::<_, TestError>(p.ack())
                     }
                 }))
@@ -163,7 +160,7 @@ async fn test_ping() -> std::io::Result<()> {
     let io = srv.connect().await.unwrap();
     let mut framed = Framed::new(io, codec::Codec::new());
     framed
-        .send(codec::Packet::Connect(codec::Connect::default().client_id("user")))
+        .send(codec::Packet::Connect(Box::new(codec::Connect::default().client_id("user"))))
         .await
         .unwrap();
     let _ = framed.next().await.unwrap().unwrap();
@@ -181,7 +178,7 @@ async fn test_ack_order() -> std::io::Result<()> {
     let srv = server::test_server(move || {
         MqttServer::new(handshake)
             .publish(|p: Publish| {
-                delay_for(Duration::from_millis(100)).map(move |_| Ok::<_, TestError>(p.ack()))
+                sleep(Duration::from_millis(100)).map(move |_| Ok::<_, TestError>(p.ack()))
             })
             .control(move |msg| match msg {
                 ControlMessage::Subscribe(mut msg) => {
@@ -200,7 +197,7 @@ async fn test_ack_order() -> std::io::Result<()> {
     let io = srv.connect().await.unwrap();
     let mut framed = Framed::new(io, codec::Codec::default());
     framed
-        .send(codec::Packet::Connect(codec::Connect::default().client_id("user")))
+        .send(codec::Packet::Connect(Box::new(codec::Connect::default().client_id("user"))))
         .await
         .unwrap();
     let _ = framed.next().await.unwrap().unwrap();
@@ -263,8 +260,7 @@ async fn test_dups() {
     let srv = server::test_server(move || {
         MqttServer::new(handshake)
             .publish(|p: Publish| {
-                delay_for(Duration::from_millis(10000))
-                    .map(move |_| Ok::<_, TestError>(p.ack()))
+                sleep(Duration::from_millis(10000)).map(move |_| Ok::<_, TestError>(p.ack()))
             })
             .finish()
     });
@@ -272,9 +268,9 @@ async fn test_dups() {
     let io = srv.connect().await.unwrap();
     let mut framed = Framed::new(io, codec::Codec::default());
     framed
-        .send(codec::Packet::Connect(
+        .send(codec::Packet::Connect(Box::new(
             codec::Connect::default().client_id("user").receive_max(2),
-        ))
+        )))
         .await
         .unwrap();
     let _ = framed.next().await.unwrap().unwrap();
@@ -377,8 +373,7 @@ async fn test_max_receive() {
             .receive_max(1)
             .max_qos(codec::QoS::AtLeastOnce)
             .publish(|p: Publish| {
-                delay_for(Duration::from_millis(10000))
-                    .map(move |_| Ok::<_, TestError>(p.ack()))
+                sleep(Duration::from_millis(10000)).map(move |_| Ok::<_, TestError>(p.ack()))
             })
             .control(move |msg| match msg {
                 ControlMessage::ProtocolError(msg) => ok::<_, TestError>(msg.ack()),
@@ -390,19 +385,19 @@ async fn test_max_receive() {
     let mut framed = Framed::new(io, codec::Codec::default());
 
     framed
-        .send(codec::Packet::Connect(codec::Connect::default().client_id("user")))
+        .send(codec::Packet::Connect(Box::new(codec::Connect::default().client_id("user"))))
         .await
         .unwrap();
     let ack = framed.next().await.unwrap().unwrap();
     assert_eq!(
         ack,
-        codec::Packet::ConnectAck(codec::ConnectAck {
+        codec::Packet::ConnectAck(Box::new(codec::ConnectAck {
             receive_max: Some(NonZeroU16::new(1).unwrap()),
             max_qos: Some(codec::QoS::AtLeastOnce),
             reason_code: codec::ConnectAckReason::Success,
             topic_alias_max: 32,
             ..Default::default()
-        })
+        }))
     );
 
     framed
@@ -463,7 +458,7 @@ async fn test_keepalive() {
     ntex::rt::spawn(client.start_default());
 
     assert!(sink.is_open());
-    delay_for(Duration::from_millis(2500)).await;
+    sleep(Duration::from_millis(2500)).await;
     assert!(!sink.is_open());
     assert!(ka.load(Relaxed));
 }
@@ -502,11 +497,11 @@ async fn test_keepalive2() {
     let res =
         sink.publish(ByteString::from_static("#"), Bytes::new()).send_at_least_once().await;
     assert!(res.is_ok());
-    delay_for(Duration::from_millis(1200)).await;
+    sleep(Duration::from_millis(1200)).await;
     let res =
         sink.publish(ByteString::from_static("#"), Bytes::new()).send_at_least_once().await;
     assert!(res.is_ok());
-    delay_for(Duration::from_millis(2500)).await;
+    sleep(Duration::from_millis(2500)).await;
 
     assert!(!sink.is_open());
     assert!(ka.load(Relaxed));
@@ -532,7 +527,7 @@ async fn test_sink_encoder_error_pub_qos1() {
             Ok(con.ack(St))
         })
         .publish(|p: Publish| {
-            delay_for(Duration::from_millis(50)).map(move |_| Ok::<_, TestError>(p.ack()))
+            sleep(Duration::from_millis(50)).map(move |_| Ok::<_, TestError>(p.ack()))
         })
         .control(move |msg| match msg {
             ControlMessage::ProtocolError(msg) => ok::<_, TestError>(msg.ack()),
@@ -576,7 +571,7 @@ async fn test_sink_encoder_error_pub_qos0() {
             Ok(con.ack(St))
         })
         .publish(|p: Publish| {
-            delay_for(Duration::from_millis(50)).map(move |_| Ok::<_, TestError>(p.ack()))
+            sleep(Duration::from_millis(50)).map(move |_| Ok::<_, TestError>(p.ack()))
         })
         .control(move |msg| match msg {
             ControlMessage::ProtocolError(msg) => ok::<_, TestError>(msg.ack()),
@@ -662,7 +657,7 @@ async fn test_suback_with_reason() -> std::io::Result<()> {
     let io = srv.connect().await.unwrap();
     let mut framed = Framed::new(io, codec::Codec::new());
     framed
-        .send(codec::Packet::Connect(codec::Connect::default().client_id("user")))
+        .send(codec::Packet::Connect(Box::new(codec::Connect::default().client_id("user"))))
         .await
         .unwrap();
     let _ = framed.next().await.unwrap().unwrap();
@@ -694,6 +689,56 @@ async fn test_suback_with_reason() -> std::io::Result<()> {
             reason_string: Some("some reason".into()),
         })
     );
+
+    Ok(())
+}
+
+#[ntex::test]
+async fn test_handle_incoming() -> std::io::Result<()> {
+    let publish = Arc::new(AtomicBool::new(false));
+    let publish2 = publish.clone();
+    let disconnect = Arc::new(AtomicBool::new(false));
+    let disconnect2 = disconnect.clone();
+
+    let srv = server::test_server(move || {
+        let publish = publish2.clone();
+        let disconnect = disconnect2.clone();
+        MqttServer::new(handshake)
+            .publish(move |p: Publish| {
+                publish.store(true, Relaxed);
+                ok::<_, TestError>(p.ack())
+            })
+            .control(move |msg| match msg {
+                ControlMessage::Disconnect(msg) => {
+                    disconnect.store(true, Relaxed);
+                    ok::<_, TestError>(msg.ack())
+                }
+                _ => ok(msg.disconnect()),
+            })
+            .finish()
+    });
+
+    let io = srv.connect().await.unwrap();
+    let mut framed = Framed::new(io, codec::Codec::default());
+    framed
+        .write(codec::Packet::Connect(Box::new(codec::Connect::default().client_id("user"))))
+        .unwrap();
+    framed.write(pkt_publish().into()).unwrap();
+    framed
+        .write(codec::Packet::Disconnect(codec::Disconnect {
+            reason_code: codec::DisconnectReasonCode::ReceiveMaximumExceeded,
+            session_expiry_interval_secs: None,
+            server_reference: None,
+            reason_string: None,
+            user_properties: Default::default(),
+        }))
+        .unwrap();
+    poll_fn(|cx| framed.flush(cx)).await.unwrap();
+    drop(framed);
+    sleep(Duration::from_millis(500)).await;
+
+    assert!(publish.load(Relaxed));
+    assert!(disconnect.load(Relaxed));
 
     Ok(())
 }

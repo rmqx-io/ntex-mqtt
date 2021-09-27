@@ -1,7 +1,7 @@
 use ntex::util::{BufMut, BytesMut};
 
 use crate::error::EncodeError;
-use crate::types::{packet_type, ConnectFlags, QoS, WILL_QOS_SHIFT};
+use crate::types::{packet_type, ConnectFlags, QoS, MQTT, MQTT_LEVEL_3, WILL_QOS_SHIFT};
 use crate::utils::{write_variable_length, Encode};
 
 use super::packet::*;
@@ -9,7 +9,7 @@ use super::packet::*;
 pub(crate) fn get_encoded_size(packet: &Packet) -> usize {
     match *packet {
         Packet::Connect ( ref connect ) => {
-            let Connect {ref last_will, ref client_id, ref username, ref password, ..} = *connect;
+            let Connect {ref last_will, ref client_id, ref username, ref password, ..} = **connect;
 
             // Protocol Name + Protocol Level + Connect Flags + Keep Alive
             let mut n = 2 + 4 + 1 + 1 + 2;
@@ -164,7 +164,6 @@ pub(crate) fn encode(
 
 fn encode_connect(connect: &Connect, dst: &mut BytesMut) -> Result<(), EncodeError> {
     let Connect {
-        protocol,
         clean_session,
         keep_alive,
         ref last_will,
@@ -173,8 +172,7 @@ fn encode_connect(connect: &Connect, dst: &mut BytesMut) -> Result<(), EncodeErr
         ref password,
     } = *connect;
 
-    //MQTT.as_ref().encode(dst)?;
-    protocol.name().as_bytes().encode(dst)?;
+    MQTT.as_ref().encode(dst)?;
 
     let mut flags = ConnectFlags::empty();
 
@@ -201,8 +199,7 @@ fn encode_connect(connect: &Connect, dst: &mut BytesMut) -> Result<(), EncodeErr
         flags |= ConnectFlags::CLEAN_START;
     }
 
-    //dst.put_slice(&[MQTT_LEVEL_311, flags.bits()]);
-    dst.put_slice(&[protocol.level(), flags.bits()]);
+    dst.put_slice(&[MQTT_LEVEL_3, flags.bits()]);
     dst.put_u16(keep_alive);
     client_id.encode(dst)?;
 
@@ -227,7 +224,6 @@ mod tests {
     use std::num::NonZeroU16;
 
     use super::*;
-    use crate::types::Protocol;
 
     fn packet_id(v: u16) -> NonZeroU16 {
         NonZeroU16::new(v).unwrap()
@@ -235,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_encode_fixed_header() {
-        let mut v = BytesMut::new();
+        let mut v = BytesMut::with_capacity(271);
         let p = Packet::PingRequest;
 
         assert_eq!(get_encoded_size(&p), 0);
@@ -268,22 +264,20 @@ mod tests {
     #[test]
     fn test_encode_connect_packets() {
         assert_encode_packet(
-            &Packet::Connect(Connect {
-                protocol: Protocol::default(),
+            &Packet::Connect(Box::new(Connect {
                 clean_session: false,
                 keep_alive: 60,
                 client_id: ByteString::from_static("12345"),
                 last_will: None,
                 username: Some(ByteString::from_static("user")),
                 password: Some(Bytes::from_static(b"pass")),
-            }),
+            })),
             &b"\x10\x1D\x00\x04MQTT\x04\xC0\x00\x3C\x00\
 \x0512345\x00\x04user\x00\x04pass"[..],
         );
 
         assert_encode_packet(
-            &Packet::Connect(Connect {
-                protocol: Protocol::default(),
+            &Packet::Connect(Box::new(Connect {
                 clean_session: false,
                 keep_alive: 60,
                 client_id: ByteString::from_static("12345"),
@@ -295,7 +289,7 @@ mod tests {
                 }),
                 username: None,
                 password: None,
-            }),
+            })),
             &b"\x10\x21\x00\x04MQTT\x04\x14\x00\x3C\x00\
 \x0512345\x00\x05topic\x00\x07message"[..],
         );

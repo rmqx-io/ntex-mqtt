@@ -1,6 +1,67 @@
 # Changes
 
-## [0.6.7] - 2021-05-xx
+## [0.7.1] - 2021-09-18
+
+* Allow to extract error from control message
+
+## [0.7.0] - 2021-09-17
+
+* Update ntex to 0.4
+
+## [0.7.0-b.10] - 2021-09-07
+
+* v3: add ControlMessage::Error and ControlMessage::ProtocolError
+
+## [0.7.0-b.9] - 2021-09-07
+
+* v5: add helper methods to client control publish message
+
+## [0.7.0-b.8] - 2021-08-28
+
+* use new ntex's timer api
+
+## [0.7.0-b.7] - 2021-08-16
+
+* v3: Boxed Packet::Connect to trim down Packet size
+* v5: Boxed Packet::Connect and Packet::ConnAck variants to trim down Packet size
+
+## [0.7.0-b.6] - 2021-07-28
+
+* v3/v5: Fixed nested with_queues calls in sink impl
+
+## [0.7.0-b.5] - 2021-07-15
+
+* v3/v5: PublishBuilder::send_at_least_once initiates publish synchronously
+
+* v3/v5: Publish::take_payload() replaces payload with empty bytes, returns existing
+
+## [0.7.0-b.4] - 2021-07-12
+
+* v3: avoid nested borrow_mut() calls in sink on puback mismatch
+
+## [0.7.0-b.3] - 2021-07-04
+
+* Re-export ClientRouter, SubscribeBuilder, UnsubscribeBuilder
+
+## [0.7.0-b.2] - 2021-06-30
+
+* v3: Remove special treatment for "?" in publish's topic
+
+## [0.7.0-b.1] - 2021-06-27
+
+* Upgrade to ntex-0.4
+
+## [0.6.9] - 2021-06-17
+
+* Use `Handshake<Io>` instead of `codec::Connect` for selector
+
+## [0.6.8] - 2021-06-17
+
+* Add coonditional mqtt server selector
+
+## [0.6.7] - 2021-05-17
+
+* Process unhandled data on disconnect #51
 
 * Fix for panic while parsing MQTT version #52
 

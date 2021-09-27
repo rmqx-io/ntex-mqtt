@@ -1,24 +1,25 @@
-use std::{cell::RefCell, convert::TryFrom, fmt, marker, pin::Pin, rc::Rc, time::Duration};
+use std::task::{Context, Poll};
+use std::{cell::RefCell, convert::TryFrom, fmt, future::Future, marker, pin::Pin, rc::Rc};
 
 use ntex::codec::{AsyncRead, AsyncWrite};
-use ntex::framed::{State, WriteTask};
-use ntex::rt::time::Sleep;
+use ntex::framed::WriteTask;
 use ntex::service::{IntoServiceFactory, Service, ServiceFactory};
+use ntex::time::{Millis, Seconds, Sleep};
 use ntex::util::timeout::{Timeout, TimeoutError};
+use ntex::util::Either;
 
 use crate::error::{MqttError, ProtocolError};
-use crate::service::{FactoryBuilder, FactoryBuilder2};
+use crate::io::{DispatchItem, Dispatcher, State, Timer};
+use crate::service::{FramedService, FramedService2};
 use crate::types::QoS;
 
-use super::codec as mqtt;
 use super::control::{ControlMessage, ControlResult};
 use super::default::{DefaultControlService, DefaultPublishService};
-use super::dispatcher::factory;
 use super::handshake::{Handshake, HandshakeAck};
-use super::publish::{PublishMessage, PublishResult};
+use super::publish::{Publish, PublishAck};
+use super::selector::SelectItem;
 use super::shared::{MqttShared, MqttSinkPool};
-use super::sink::MqttSink;
-use super::Session;
+use super::{codec as mqtt, dispatcher::factory, MqttSink, Session};
 
 /// Mqtt Server
 pub struct MqttServer<Io, St, C: ServiceFactory, Cn: ServiceFactory, P: ServiceFactory> {
@@ -28,12 +29,10 @@ pub struct MqttServer<Io, St, C: ServiceFactory, Cn: ServiceFactory, P: ServiceF
     max_size: u32,
     max_receive: u16,
     max_qos: Option<QoS>,
-    handshake_timeout: u16,
-    disconnect_timeout: u16,
+    handshake_timeout: Seconds,
+    disconnect_timeout: Seconds,
     max_topic_alias: u16,
-    max_awaiting_rel: usize,
-    await_rel_timeout: Duration,
-    pool: Rc<MqttSinkPool>,
+    pub(super) pool: Rc<MqttSinkPool>,
     _t: marker::PhantomData<(Io, St)>,
 }
 
@@ -63,11 +62,9 @@ where
             max_size: 0,
             max_receive: 15,
             max_qos: None,
-            handshake_timeout: 0,
-            disconnect_timeout: 3000,
+            handshake_timeout: Seconds::ZERO,
+            disconnect_timeout: Seconds(3),
             max_topic_alias: 32,
-            max_awaiting_rel: 0,
-            await_rel_timeout: Duration::default(),
             pool: Rc::new(MqttSinkPool::default()),
             _t: marker::PhantomData,
         }
@@ -86,19 +83,18 @@ where
             Request = ControlMessage<C::Error>,
             Response = ControlResult,
         > + 'static,
-    P: ServiceFactory<Config = Session<St>, Request = PublishMessage, Response = PublishResult>
-        + 'static,
+    P: ServiceFactory<Config = Session<St>, Request = Publish, Response = PublishAck> + 'static,
 {
-    /// Set handshake timeout in millis.
+    /// Set handshake timeout.
     ///
     /// Handshake includes `connect` packet and response `connect-ack`.
     /// By default handshake timeuot is disabled.
-    pub fn handshake_timeout(mut self, timeout: u16) -> Self {
+    pub fn handshake_timeout(mut self, timeout: Seconds) -> Self {
         self.handshake_timeout = timeout;
         self
     }
 
-    /// Set server connection disconnect timeout in milliseconds.
+    /// Set server connection disconnect timeout.
     ///
     /// Defines a timeout for disconnect connection. If a disconnect procedure does not complete
     /// within this time, the connection get dropped.
@@ -106,7 +102,7 @@ where
     /// To disable timeout set value to 0.
     ///
     /// By default disconnect timeout is set to 3 seconds.
-    pub fn disconnect_timeout(mut self, val: u16) -> Self {
+    pub fn disconnect_timeout(mut self, val: Seconds) -> Self {
         self.disconnect_timeout = val;
         self
     }
@@ -145,18 +141,6 @@ where
         self
     }
 
-    ///
-    pub fn max_awaiting_rel(mut self, val: usize) -> Self {
-        self.max_awaiting_rel = val;
-        self
-    }
-
-    ///
-    pub fn await_rel_timeout(mut self, val: Duration) -> Self {
-        self.await_rel_timeout = val;
-        self
-    }
-
     /// Service to handle control messages
     pub fn control<F, Srv>(self, service: F) -> MqttServer<Io, St, C, Srv, P>
     where
@@ -178,8 +162,6 @@ where
             max_qos: self.max_qos,
             handshake_timeout: self.handshake_timeout,
             disconnect_timeout: self.disconnect_timeout,
-            max_awaiting_rel: self.max_awaiting_rel,
-            await_rel_timeout: self.await_rel_timeout,
             pool: self.pool,
             _t: marker::PhantomData,
         }
@@ -190,13 +172,10 @@ where
     where
         F: IntoServiceFactory<Srv> + 'static,
         C::Error: From<Srv::Error> + From<Srv::InitError>,
-        Srv: ServiceFactory<
-                Config = Session<St>,
-                Request = PublishMessage,
-                Response = PublishResult,
-            > + 'static,
+        Srv: ServiceFactory<Config = Session<St>, Request = Publish, Response = PublishAck>
+            + 'static,
         Srv::Error: fmt::Debug,
-        PublishResult: TryFrom<Srv::Error, Error = C::Error>,
+        PublishAck: TryFrom<Srv::Error, Error = C::Error>,
     {
         MqttServer {
             handshake: self.handshake,
@@ -208,8 +187,6 @@ where
             max_qos: self.max_qos,
             handshake_timeout: self.handshake_timeout,
             disconnect_timeout: self.disconnect_timeout,
-            max_awaiting_rel: self.max_awaiting_rel,
-            await_rel_timeout: self.await_rel_timeout,
             pool: self.pool,
             _t: marker::PhantomData,
         }
@@ -232,10 +209,9 @@ where
             Request = ControlMessage<C::Error>,
             Response = ControlResult,
         > + 'static,
-    P: ServiceFactory<Config = Session<St>, Request = PublishMessage, Response = PublishResult>
-        + 'static,
+    P: ServiceFactory<Config = Session<St>, Request = Publish, Response = PublishAck> + 'static,
     P::Error: fmt::Debug,
-    PublishResult: TryFrom<P::Error, Error = C::Error>,
+    PublishAck: TryFrom<P::Error, Error = C::Error>,
 {
     /// Set service to handle publish packets and create mqtt server factory
     pub fn finish(
@@ -249,8 +225,8 @@ where
             .map_err(<C::Error>::from)
             .map_init_err(|e| MqttError::Service(e.into()));
 
-        ntex::unit_config(
-            FactoryBuilder::new(handshake_service_factory(
+        FramedService::new(
+            handshake_service_factory(
                 handshake,
                 self.max_size,
                 self.max_receive,
@@ -258,14 +234,9 @@ where
                 self.max_qos,
                 self.handshake_timeout,
                 self.pool,
-            ))
-            .disconnect_timeout(self.disconnect_timeout)
-            .build(factory(
-                publish,
-                control,
-                self.max_awaiting_rel,
-                self.await_rel_timeout,
-            )),
+            ),
+            factory(publish, control),
+            self.disconnect_timeout,
         )
     }
 
@@ -274,7 +245,7 @@ where
         self,
     ) -> impl ServiceFactory<
         Config = (),
-        Request = (Io, State, Option<Pin<Box<Sleep>>>),
+        Request = (Io, State, Option<Sleep>),
         Response = (),
         Error = MqttError<C::Error>,
         InitError = C::InitError,
@@ -286,8 +257,8 @@ where
             .map_err(<C::Error>::from)
             .map_init_err(|e| MqttError::Service(e.into()));
 
-        ntex::unit_config(
-            FactoryBuilder2::new(handshake_service_factory2(
+        FramedService2::new(
+            handshake_service_factory2(
                 handshake,
                 self.max_size,
                 self.max_receive,
@@ -295,15 +266,45 @@ where
                 self.max_qos,
                 self.handshake_timeout,
                 self.pool,
-            ))
-            .disconnect_timeout(self.disconnect_timeout)
-            .build(factory(
-                publish,
-                control,
-                self.max_awaiting_rel,
-                self.await_rel_timeout,
-            )),
+            ),
+            factory(publish, control),
+            self.disconnect_timeout,
         )
+    }
+
+    /// Set service to handle publish packets and create mqtt server factory
+    pub(crate) fn finish_selector<F, R>(
+        self,
+        check: F,
+    ) -> impl ServiceFactory<
+        Config = (),
+        Request = SelectItem<Io>,
+        Response = Either<SelectItem<Io>, ()>,
+        Error = MqttError<C::Error>,
+        InitError = C::InitError,
+    >
+    where
+        F: Fn(&Handshake<Io>) -> R + 'static,
+        R: Future<Output = Result<bool, C::Error>> + 'static,
+    {
+        let publish = self.srv_publish.map_init_err(|e| MqttError::Service(e.into()));
+        let control = self
+            .srv_control
+            .map_err(<C::Error>::from)
+            .map_init_err(|e| MqttError::Service(e.into()));
+
+        ServerSelector::<St, _, _, Io, _, _> {
+            check: Rc::new(check),
+            connect: self.handshake,
+            handler: Rc::new(factory(publish, control)),
+            max_size: self.max_size,
+            max_receive: self.max_receive,
+            max_topic_alias: self.max_topic_alias,
+            max_qos: self.max_qos,
+            disconnect_timeout: self.disconnect_timeout,
+            time: Timer::new(Millis::ONE_SEC),
+            _t: marker::PhantomData,
+        }
     }
 }
 
@@ -313,12 +314,12 @@ fn handshake_service_factory<Io, St, C>(
     max_receive: u16,
     max_topic_alias: u16,
     max_qos: Option<QoS>,
-    handshake_timeout: u16,
+    handshake_timeout: Seconds,
     pool: Rc<MqttSinkPool>,
 ) -> impl ServiceFactory<
     Config = (),
     Request = Io,
-    Response = (Io, State, Rc<MqttShared>, Session<St>, u16),
+    Response = (Io, State, Rc<MqttShared>, Session<St>, Seconds),
     Error = MqttError<C::Error>,
 >
 where
@@ -326,9 +327,9 @@ where
     C: ServiceFactory<Config = (), Request = Handshake<Io>, Response = HandshakeAck<Io, St>>,
     C::Error: fmt::Debug,
 {
-    ntex::apply(
-        Timeout::new(Duration::from_millis(handshake_timeout as u64)),
-        ntex::fn_factory(move || {
+    ntex::service::apply(
+        Timeout::new(Millis::from(handshake_timeout)),
+        ntex::service::fn_factory(move || {
             let pool = pool.clone();
 
             let fut = factory.new_service(());
@@ -336,18 +337,21 @@ where
                 let service = fut.await?;
                 let pool = pool.clone();
                 let service = Rc::new(service.map_err(MqttError::Service));
-                Ok::<_, C::InitError>(ntex::apply_fn(service, move |io: Io, service| {
-                    handshake(
-                        io,
-                        None,
-                        service.clone(),
-                        max_size,
-                        max_receive,
-                        max_topic_alias,
-                        max_qos,
-                        pool.clone(),
-                    )
-                }))
+                Ok::<_, C::InitError>(ntex::service::apply_fn(
+                    service,
+                    move |io: Io, service| {
+                        handshake(
+                            io,
+                            None,
+                            service.clone(),
+                            max_size,
+                            max_receive,
+                            max_topic_alias,
+                            max_qos,
+                            pool.clone(),
+                        )
+                    },
+                ))
             }
         }),
     )
@@ -363,12 +367,12 @@ fn handshake_service_factory2<Io, St, C>(
     max_receive: u16,
     max_topic_alias: u16,
     max_qos: Option<QoS>,
-    handshake_timeout: u16,
+    handshake_timeout: Seconds,
     pool: Rc<MqttSinkPool>,
 ) -> impl ServiceFactory<
     Config = (),
     Request = (Io, State),
-    Response = (Io, State, Rc<MqttShared>, Session<St>, u16),
+    Response = (Io, State, Rc<MqttShared>, Session<St>, Seconds),
     Error = MqttError<C::Error>,
     InitError = C::InitError,
 >
@@ -377,27 +381,30 @@ where
     C: ServiceFactory<Config = (), Request = Handshake<Io>, Response = HandshakeAck<Io, St>>,
     C::Error: fmt::Debug,
 {
-    ntex::apply(
-        Timeout::new(Duration::from_millis(handshake_timeout as u64)),
-        ntex::fn_factory(move || {
+    ntex::service::apply(
+        Timeout::new(Millis::from(handshake_timeout)),
+        ntex::service::fn_factory(move || {
             let pool = pool.clone();
             let fut = factory.new_service(());
             async move {
                 let service = fut.await?;
                 let pool = pool.clone();
                 let service = Rc::new(service.map_err(MqttError::Service));
-                Ok::<_, C::InitError>(ntex::apply_fn(service, move |(io, state), service| {
-                    handshake(
-                        io,
-                        Some(state),
-                        service.clone(),
-                        max_size,
-                        max_receive,
-                        max_topic_alias,
-                        max_qos,
-                        pool.clone(),
-                    )
-                }))
+                Ok::<_, C::InitError>(ntex::service::apply_fn(
+                    service,
+                    move |(io, state), service| {
+                        handshake(
+                            io,
+                            Some(state),
+                            service.clone(),
+                            max_size,
+                            max_receive,
+                            max_topic_alias,
+                            max_qos,
+                            pool.clone(),
+                        )
+                    },
+                ))
             }
         }),
     )
@@ -417,7 +424,7 @@ async fn handshake<Io, S, St, E>(
     mut max_topic_alias: u16,
     max_qos: Option<QoS>,
     pool: Rc<MqttSinkPool>,
-) -> Result<(Io, State, Rc<MqttShared>, Session<St>, u16), S::Error>
+) -> Result<(Io, State, Rc<MqttShared>, Session<St>, Seconds), S::Error>
 where
     Io: AsyncRead + AsyncWrite + Unpin + 'static,
     S: Service<Request = Handshake<Io>, Response = HandshakeAck<Io, St>, Error = MqttError<E>>,
@@ -494,7 +501,11 @@ where
 
                     state.set_buffer_params(ack.read_hw, ack.write_hw, ack.lw);
                     state
-                        .send(&mut ack.io, &shared.codec, mqtt::Packet::ConnectAck(ack.packet))
+                        .send(
+                            &mut ack.io,
+                            &shared.codec,
+                            mqtt::Packet::ConnectAck(Box::new(ack.packet)),
+                        )
                         .await?;
 
                     Ok((
@@ -507,7 +518,7 @@ where
                             max_receive,
                             max_topic_alias,
                         ),
-                        ack.keepalive,
+                        Seconds(ack.keepalive),
                     ))
                 }
                 None => {
@@ -518,7 +529,10 @@ where
                             .shared
                             .state
                             .write()
-                            .encode(mqtt::Packet::ConnectAck(ack.packet), &ack.shared.codec)
+                            .encode(
+                                mqtt::Packet::ConnectAck(Box::new(ack.packet)),
+                                &ack.shared.codec,
+                            )
                             .is_ok()
                     {
                         WriteTask::shutdown(
@@ -538,5 +552,251 @@ where
                 "MQTT-3.1.0-1: Expected CONNECT packet",
             )))
         }
+    }
+}
+
+pub(crate) struct ServerSelector<St, C, T, Io, F, R> {
+    connect: C,
+    handler: Rc<T>,
+    time: Timer,
+    check: Rc<F>,
+    max_size: u32,
+    max_receive: u16,
+    max_qos: Option<QoS>,
+    disconnect_timeout: Seconds,
+    max_topic_alias: u16,
+    _t: marker::PhantomData<(St, Io, R)>,
+}
+
+impl<St, C, T, Io, F, R> ServiceFactory for ServerSelector<St, C, T, Io, F, R>
+where
+    Io: AsyncRead + AsyncWrite + Unpin + 'static,
+    F: Fn(&Handshake<Io>) -> R + 'static,
+    R: Future<Output = Result<bool, C::Error>>,
+    C: ServiceFactory<Config = (), Request = Handshake<Io>, Response = HandshakeAck<Io, St>>
+        + 'static,
+    C::Error: fmt::Debug,
+    T: ServiceFactory<
+            Config = Session<St>,
+            Request = DispatchItem<Rc<MqttShared>>,
+            Response = Option<mqtt::Packet>,
+            Error = MqttError<C::Error>,
+            InitError = MqttError<C::Error>,
+        > + 'static,
+{
+    type Config = ();
+    type Request = SelectItem<Io>;
+    type Response = Either<SelectItem<Io>, ()>;
+    type Error = MqttError<C::Error>;
+    type InitError = C::InitError;
+    type Service = ServerSelectorImpl<St, C::Service, T, Io, F, R>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Service, Self::InitError>>>>;
+
+    fn new_service(&self, _: ()) -> Self::Future {
+        let fut = self.connect.new_service(());
+        let handler = self.handler.clone();
+        let time = self.time.clone();
+        let check = self.check.clone();
+        let max_size = self.max_size;
+        let max_receive = self.max_receive;
+        let max_qos = self.max_qos;
+        let max_topic_alias = self.max_topic_alias;
+        let disconnect_timeout = self.disconnect_timeout;
+
+        // create connect service and then create service impl
+        Box::pin(async move {
+            Ok(ServerSelectorImpl {
+                handler,
+                time,
+                check,
+                max_size,
+                max_receive,
+                max_qos,
+                max_topic_alias,
+                disconnect_timeout,
+                connect: Rc::new(fut.await?),
+                _t: marker::PhantomData,
+            })
+        })
+    }
+}
+
+pub(crate) struct ServerSelectorImpl<St, C, T, Io, F, R> {
+    check: Rc<F>,
+    connect: Rc<C>,
+    handler: Rc<T>,
+    max_size: u32,
+    max_receive: u16,
+    max_qos: Option<QoS>,
+    disconnect_timeout: Seconds,
+    max_topic_alias: u16,
+    time: Timer,
+    _t: marker::PhantomData<(St, Io, R)>,
+}
+
+impl<St, C, T, Io, F, R> Service for ServerSelectorImpl<St, C, T, Io, F, R>
+where
+    Io: AsyncRead + AsyncWrite + Unpin + 'static,
+    F: Fn(&Handshake<Io>) -> R + 'static,
+    R: Future<Output = Result<bool, C::Error>>,
+    C: Service<Request = Handshake<Io>, Response = HandshakeAck<Io, St>> + 'static,
+    C::Error: fmt::Debug,
+    T: ServiceFactory<
+            Config = Session<St>,
+            Request = DispatchItem<Rc<MqttShared>>,
+            Response = Option<mqtt::Packet>,
+            Error = MqttError<C::Error>,
+            InitError = MqttError<C::Error>,
+        > + 'static,
+{
+    type Request = SelectItem<Io>;
+    type Response = Either<SelectItem<Io>, ()>;
+    type Error = MqttError<C::Error>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+
+    #[inline]
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.connect.poll_ready(cx).map_err(MqttError::Service)
+    }
+
+    #[inline]
+    fn poll_shutdown(&self, cx: &mut Context<'_>, is_error: bool) -> Poll<()> {
+        self.connect.poll_shutdown(cx, is_error)
+    }
+
+    #[inline]
+    fn call(&self, req: Self::Request) -> Self::Future {
+        log::trace!("Start connection handshake");
+
+        let check = self.check.clone();
+        let connect = self.connect.clone();
+        let handler = self.handler.clone();
+        let timeout = self.disconnect_timeout;
+        let time = self.time.clone();
+        let max_qos = self.max_qos;
+        let max_size = self.max_size;
+        let mut max_receive = self.max_receive;
+        let mut max_topic_alias = self.max_topic_alias;
+
+        Box::pin(async move {
+            let (mut hnd, state, mut delay) = req;
+
+            let result = if let Some(ref mut delay) = delay {
+                let fut = (&*check)(&hnd);
+                match crate::utils::select(fut, delay).await {
+                    Either::Left(res) => res,
+                    Either::Right(_) => return Err(MqttError::HandshakeTimeout),
+                }
+            } else {
+                (&*check)(&hnd).await
+            };
+
+            if !result.map_err(MqttError::Service)? {
+                Ok(Either::Left((hnd, state, delay)))
+            } else {
+                // set max outbound (encoder) packet size
+                if let Some(size) = hnd.packet().max_packet_size {
+                    hnd.shared.codec.set_max_outbound_size(size.get());
+                }
+                hnd.shared
+                    .cap
+                    .set(hnd.packet().receive_max.map(|v| v.get()).unwrap_or(16) as usize);
+
+                let keep_alive = hnd.packet().keep_alive;
+                hnd.max_size = max_size;
+                hnd.max_receive = max_receive;
+                hnd.max_topic_alias = max_topic_alias;
+
+                // authenticate mqtt connection
+                let mut ack = if let Some(ref mut delay) = delay {
+                    let fut = connect.call(hnd);
+                    match crate::utils::select(fut, delay).await {
+                        Either::Left(res) => res.map_err(|e| {
+                            log::trace!("Connection handshake failed: {:?}", e);
+                            MqttError::Service(e)
+                        })?,
+                        Either::Right(_) => return Err(MqttError::HandshakeTimeout),
+                    }
+                } else {
+                    connect.call(hnd).await.map_err(|e| {
+                        log::trace!("Connection handshake failed: {:?}", e);
+                        MqttError::Service(e)
+                    })?
+                };
+
+                match ack.session {
+                    Some(session) => {
+                        log::trace!("Sending: {:#?}", ack.packet);
+                        let shared = ack.shared;
+
+                        max_topic_alias = ack.packet.topic_alias_max;
+
+                        if ack.packet.max_qos.is_none() {
+                            ack.packet.max_qos = max_qos;
+                        }
+
+                        if let Some(num) = ack.packet.receive_max {
+                            max_receive = num.get();
+                        } else {
+                            max_receive = 0;
+                        }
+                        if let Some(size) = ack.packet.max_packet_size {
+                            shared.codec.set_max_inbound_size(size);
+                        }
+                        if ack.packet.server_keepalive_sec.is_none()
+                            && (keep_alive > ack.keepalive as u16)
+                        {
+                            ack.packet.server_keepalive_sec = Some(ack.keepalive as u16);
+                        }
+
+                        state.set_buffer_params(ack.read_hw, ack.write_hw, ack.lw);
+                        state
+                            .send(
+                                &mut ack.io,
+                                &shared.codec,
+                                mqtt::Packet::ConnectAck(Box::new(ack.packet)),
+                            )
+                            .await?;
+
+                        let session = Session::new_v5(
+                            session,
+                            MqttSink::new(shared.clone()),
+                            max_receive,
+                            max_topic_alias,
+                        );
+                        let handler = handler.new_service(session).await?;
+                        log::trace!("Connection handler is created, starting dispatcher");
+
+                        Dispatcher::with(ack.io, shared.state.clone(), shared, handler, time)
+                            .keepalive_timeout(Seconds(ack.keepalive))
+                            .disconnect_timeout(timeout)
+                            .await?;
+                        Ok(Either::Right(()))
+                    }
+                    None => {
+                        log::trace!("Failed to complete handshake: {:#?}", ack.packet);
+
+                        if ack.shared.state.is_open()
+                            && ack
+                                .shared
+                                .state
+                                .write()
+                                .encode(
+                                    mqtt::Packet::ConnectAck(Box::new(ack.packet)),
+                                    &ack.shared.codec,
+                                )
+                                .is_ok()
+                        {
+                            WriteTask::shutdown(
+                                Rc::new(RefCell::new(ack.io)),
+                                ack.shared.state.clone(),
+                            )
+                            .await;
+                        }
+                        Err(MqttError::Disconnected)
+                    }
+                }
+            }
+        })
     }
 }

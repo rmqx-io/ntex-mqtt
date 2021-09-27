@@ -1,4 +1,4 @@
-use std::num::NonZeroU16;
+use std::{mem, num::NonZeroU16};
 
 use ntex::router::Path;
 use ntex::util::{ByteString, Bytes};
@@ -6,41 +6,6 @@ use serde::de::DeserializeOwned;
 use serde_json::Error as JsonError;
 
 use super::codec;
-
-#[derive(Debug)]
-pub enum PublishMessage {
-    /// Publish packet
-    Publish(Publish),
-    /// Publish acknowledgment packet
-    PublishAck(codec::PublishAck),
-    ///Publish received packet
-    PublishReceived(codec::PublishAck),
-    ///Publish complete packet
-    PublishComplete(codec::PublishAck2),
-}
-
-impl PublishMessage {
-    /// Create acknowledgement for this packet
-    pub fn ack(self) -> PublishResult {
-        match self {
-            PublishMessage::Publish(_p) => {
-                PublishResult::PublishAck(PublishAck::new(codec::PublishAckReason::Success))
-            }
-            PublishMessage::PublishAck(_ack) => PublishResult::Nothing,
-            PublishMessage::PublishReceived(ack) => {
-                PublishResult::PublishRelease(ack.packet_id)
-            }
-            PublishMessage::PublishComplete(_ack2) => PublishResult::Nothing,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum PublishResult {
-    PublishAck(PublishAck),
-    PublishRelease(NonZeroU16),
-    Nothing,
-}
 
 /// Publish message
 pub struct Publish {
@@ -108,9 +73,9 @@ impl Publish {
         &self.publish.payload
     }
 
-    /// Extract Bytes from packet payload
-    pub fn take_payload(&self) -> Bytes {
-        self.publish.payload.clone()
+    /// Replace packet'a payload with empty bytes, returns existing payload.
+    pub fn take_payload(&mut self) -> Bytes {
+        mem::take(&mut self.publish.payload)
     }
 
     /// Loads and parse `application/json` encoded body.
@@ -138,8 +103,8 @@ impl std::fmt::Debug for Publish {
     }
 }
 
-/// Publish ack
 #[derive(Debug)]
+/// Publish ack
 pub struct PublishAck {
     pub(crate) reason_code: codec::PublishAckReason,
     pub(crate) properties: codec::UserProperties,

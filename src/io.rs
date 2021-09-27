@@ -6,7 +6,7 @@ pub(crate) use ntex::framed::{DispatchItem, ReadTask, State, Timer, Write, Write
 
 use ntex::codec::{AsyncRead, AsyncWrite, Decoder, Encoder};
 use ntex::service::{IntoService, Service};
-use ntex::util::Either;
+use ntex::{time::Seconds, util::Either};
 
 type Response<U> = <U as Encoder>::Item;
 
@@ -28,7 +28,7 @@ pin_project_lite::pin_project! {
         st: IoDispatcherState,
         timer: Timer,
         updated: time::Instant,
-        keepalive_timeout: u16,
+        keepalive_timeout: Seconds,
         #[pin]
         response: Option<S::Future>,
         response_idx: usize,
@@ -119,11 +119,11 @@ where
         T: AsyncRead + AsyncWrite + Unpin + 'static,
     {
         let updated = timer.now();
-        let keepalive_timeout: u16 = 30;
+        let keepalive_timeout = Seconds(30);
         let io = Rc::new(RefCell::new(io));
 
         // register keepalive timer
-        let expire = updated + time::Duration::from_secs(keepalive_timeout as u64);
+        let expire = updated + time::Duration::from(keepalive_timeout);
         timer.register(expire, expire, &state);
 
         let inner = Rc::new(RefCell::new(DispatcherState {
@@ -155,22 +155,21 @@ where
     /// To disable timeout set value to 0.
     ///
     /// By default keep-alive timeout is set to 30 seconds.
-    pub(crate) fn keepalive_timeout(mut self, timeout: u16) -> Self {
+    pub(crate) fn keepalive_timeout(mut self, timeout: Seconds) -> Self {
         // register keepalive timer
-        let prev = self.updated + time::Duration::from_secs(self.keepalive_timeout as u64);
-        if timeout == 0 {
+        let prev = self.updated + time::Duration::from(self.keepalive_timeout);
+        if timeout.is_zero() {
             self.timer.unregister(prev, &self.state);
         } else {
-            let expire = self.updated + time::Duration::from_secs(timeout as u64);
+            let expire = self.updated + time::Duration::from(timeout);
             self.timer.register(expire, prev, &self.state);
         }
 
         self.keepalive_timeout = timeout;
-
         self
     }
 
-    /// Set connection disconnect timeout in milliseconds.
+    /// Set connection disconnect timeout.
     ///
     /// Defines a timeout for disconnect connection. If a disconnect procedure does not complete
     /// within this time, the connection get dropped.
@@ -178,7 +177,7 @@ where
     /// To disable timeout set value to 0.
     ///
     /// By default disconnect timeout is set to 1 seconds.
-    pub(crate) fn disconnect_timeout(self, val: u16) -> Self {
+    pub(crate) fn disconnect_timeout(self, val: Seconds) -> Self {
         self.state.set_disconnect_timeout(val);
         self
     }
@@ -263,7 +262,7 @@ where
         match this.st {
             IoDispatcherState::Processing => {
                 loop {
-                    // log::trace!("IO-DISP state :{:?}:", this.state.get_flags());
+                    // log::trace!("IO-DISP state :{:?}:", this.state.flags());
 
                     match this.service.poll_ready(cx) {
                         Poll::Ready(Ok(_)) => {
@@ -283,43 +282,48 @@ where
                             }
 
                             let item = if this.state.is_dispatcher_stopped() {
-                                log::trace!("dispatcher is instructed to stop");
+                                retry = true;
                                 let mut inner = this.inner.borrow_mut();
 
-                                if *this.keepalive_timeout != 0 {
-                                    // unregister keep-alive timer
+                                // unregister keep-alive timer
+                                if this.keepalive_timeout.non_zero() {
                                     this.timer.unregister(
                                         *this.updated
-                                            + time::Duration::from_secs(
-                                                *this.keepalive_timeout as u64,
-                                            ),
+                                            + time::Duration::from(*this.keepalive_timeout),
                                         this.state,
                                     );
                                 }
 
-                                // check for errors
-                                let item = inner
-                                    .error
-                                    .as_mut()
-                                    .and_then(|err| err.take())
-                                    .or_else(|| {
-                                        this.state.take_io_error().map(DispatchItem::IoError)
-                                    });
-                                *this.st = IoDispatcherState::Stop;
-                                retry = true;
+                                // process unhandled data
+                                if let Ok(Some(el)) = read.decode(this.codec) {
+                                    Some(DispatchItem::Item(el))
+                                } else {
+                                    log::trace!("dispatcher is instructed to stop");
 
-                                item
+                                    // check for errors
+                                    let item = inner
+                                        .error
+                                        .as_mut()
+                                        .and_then(|err| err.take())
+                                        .or_else(|| {
+                                            this.state
+                                                .take_io_error()
+                                                .map(DispatchItem::IoError)
+                                        });
+                                    *this.st = IoDispatcherState::Stop;
+                                    item
+                                }
                             } else {
                                 // decode incoming bytes stream
                                 if read.is_ready() {
                                     match read.decode(this.codec) {
                                         Ok(Some(el)) => {
                                             // update keep-alive timer
-                                            if *this.keepalive_timeout != 0 {
+                                            if this.keepalive_timeout.non_zero() {
                                                 let updated = this.timer.now();
                                                 if updated != *this.updated {
-                                                    let ka = time::Duration::from_secs(
-                                                        *this.keepalive_timeout as u64,
+                                                    let ka = time::Duration::from(
+                                                        *this.keepalive_timeout,
                                                     );
                                                     this.timer.register(
                                                         updated + ka,
@@ -342,11 +346,11 @@ where
                                             *this.st = IoDispatcherState::Stop;
 
                                             // unregister keep-alive timer
-                                            if *this.keepalive_timeout != 0 {
+                                            if this.keepalive_timeout.non_zero() {
                                                 this.timer.unregister(
                                                     *this.updated
-                                                        + time::Duration::from_secs(
-                                                            *this.keepalive_timeout as u64,
+                                                        + time::Duration::from(
+                                                            *this.keepalive_timeout,
                                                         ),
                                                     this.state,
                                                 );
@@ -433,12 +437,10 @@ where
                             this.state.dispatcher_stopped();
 
                             // unregister keep-alive timer
-                            if *this.keepalive_timeout != 0 {
+                            if this.keepalive_timeout.non_zero() {
                                 this.timer.unregister(
                                     *this.updated
-                                        + time::Duration::from_secs(
-                                            *this.keepalive_timeout as u64,
-                                        ),
+                                        + time::Duration::from(*this.keepalive_timeout),
                                     this.state,
                                 );
                             }
@@ -490,8 +492,8 @@ where
 mod tests {
     use ntex::channel::condition::Condition;
     use ntex::codec::BytesCodec;
-    use ntex::rt::time::sleep;
     use ntex::testing::Io;
+    use ntex::time::{sleep, Millis};
     use ntex::util::Bytes;
 
     use super::*;
@@ -514,8 +516,8 @@ mod tests {
         where
             T: AsyncRead + AsyncWrite + Unpin + 'static,
         {
-            let timer = Timer::with(time::Duration::from_secs(1));
-            let keepalive_timeout = 30;
+            let timer = Timer::new(Millis::ONE_SEC);
+            let keepalive_timeout = Seconds(30);
             let updated = timer.now();
             let io = Rc::new(RefCell::new(io));
             ntex::rt::spawn(ReadTask::new(io.clone(), state.clone()));
@@ -552,7 +554,7 @@ mod tests {
             server,
             BytesCodec,
             State::new(),
-            ntex::fn_service(|msg: DispatchItem<BytesCodec>| async move {
+            ntex::service::fn_service(|msg: DispatchItem<BytesCodec>| async move {
                 sleep(time::Duration::from_millis(50)).await;
                 if let DispatchItem::Item(msg) = msg {
                     Ok::<_, ()>(Some(msg.freeze()))
@@ -585,7 +587,7 @@ mod tests {
             server,
             BytesCodec,
             State::new(),
-            ntex::fn_service(move |msg: DispatchItem<BytesCodec>| {
+            ntex::service::fn_service(move |msg: DispatchItem<BytesCodec>| {
                 let waiter = waiter.clone();
                 async move {
                     waiter.await;
@@ -600,12 +602,12 @@ mod tests {
         ntex::rt::spawn(async move {
             let _ = disp.await;
         });
-        sleep(time::Duration::from_millis(50)).await;
+        sleep(Millis(50)).await;
 
         client.write("test");
-        sleep(time::Duration::from_millis(50)).await;
+        sleep(Millis(50)).await;
         client.write("test");
-        sleep(time::Duration::from_millis(50)).await;
+        sleep(Millis(50)).await;
         condition.notify();
 
         let buf = client.read().await.unwrap();
@@ -626,7 +628,7 @@ mod tests {
             server,
             BytesCodec,
             st.clone(),
-            ntex::fn_service(|msg: DispatchItem<BytesCodec>| async move {
+            ntex::service::fn_service(|msg: DispatchItem<BytesCodec>| async move {
                 if let DispatchItem::Item(msg) = msg {
                     Ok::<_, ()>(Some(msg.freeze()))
                 } else {
@@ -635,7 +637,7 @@ mod tests {
             }),
         );
         ntex::rt::spawn(async move {
-            let _ = disp.disconnect_timeout(25).await;
+            let _ = disp.disconnect_timeout(Seconds(1)).await;
         });
 
         let buf = client.read().await.unwrap();
@@ -646,7 +648,7 @@ mod tests {
         assert_eq!(buf, Bytes::from_static(b"test"));
 
         st.close();
-        sleep(time::Duration::from_millis(200)).await;
+        sleep(Millis(1200)).await;
         assert!(client.is_server_dropped());
     }
 
@@ -661,7 +663,7 @@ mod tests {
             server,
             BytesCodec,
             state.clone(),
-            ntex::fn_service(|_: DispatchItem<BytesCodec>| async move {
+            ntex::service::fn_service(|_: DispatchItem<BytesCodec>| async move {
                 Err::<Option<Bytes>, _>(())
             }),
         );

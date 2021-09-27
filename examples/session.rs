@@ -1,7 +1,5 @@
-#![type_length_limit = "1638773"]
-
 use futures::future::ok;
-use ntex::{fn_factory_with_config, fn_service};
+use ntex::service::{fn_factory_with_config, fn_service};
 use ntex_mqtt::v5::codec::PublishAckReason;
 use ntex_mqtt::{v3, v5, MqttServer};
 

@@ -11,7 +11,7 @@ pub enum TopicError {
     InvalidLevel,
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Hash, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
 pub enum Level {
     Normal(String),
     Metadata(String), // $SYS
@@ -87,13 +87,13 @@ macro_rules! matches {
 
         for rhs in $levels {
             match lhs.next() {
-                Some(&Level::SingleWildcard) => {
-                    if !rhs.match_level(&Level::SingleWildcard) {
+                Some(&$crate::topic::Level::SingleWildcard) => {
+                    if !rhs.match_level(&$crate::topic::Level::SingleWildcard) {
                         break;
                     }
                 }
-                Some(&Level::MultiWildcard) => {
-                    return rhs.match_level(&Level::MultiWildcard);
+                Some(&$crate::topic::Level::MultiWildcard) => {
+                    return rhs.match_level(&$crate::topic::Level::MultiWildcard);
                 }
                 Some(level) if rhs.match_level(level) => continue,
                 _ => return false,
@@ -101,14 +101,14 @@ macro_rules! matches {
         }
 
         match lhs.next() {
-            Some(&Level::MultiWildcard) => true,
+            Some(&$crate::topic::Level::MultiWildcard) => true,
             Some(_) => false,
             None => true,
         }
     }};
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Topic(Vec<Level>);
 
 impl Topic {

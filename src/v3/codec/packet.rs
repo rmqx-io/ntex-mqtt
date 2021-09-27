@@ -2,7 +2,7 @@ use std::{fmt, num::NonZeroU16};
 
 use ntex::util::{ByteString, Bytes};
 
-use crate::types::{packet_type, Protocol, QoS};
+use crate::types::{packet_type, QoS};
 
 prim_enum! {
     /// Connect Return Code
@@ -58,8 +58,6 @@ pub struct LastWill {
 #[derive(Default, Debug, PartialEq, Clone)]
 /// Connect packet content
 pub struct Connect {
-    /// mqtt protocol version
-    pub protocol: Protocol,
     /// the handling of the Session state.
     pub clean_session: bool,
     /// a time interval measured in seconds.
@@ -125,7 +123,7 @@ pub enum SubscribeReturnCode {
 /// MQTT Control Packets
 pub enum Packet {
     /// Client request to connect to Server
-    Connect(Connect),
+    Connect(Box<Connect>),
 
     /// Connect acknowledgment
     ConnectAck {
@@ -196,7 +194,7 @@ pub enum Packet {
 
 impl From<Connect> for Packet {
     fn from(val: Connect) -> Packet {
-        Packet::Connect(val)
+        Packet::Connect(Box::new(val))
     }
 }
 

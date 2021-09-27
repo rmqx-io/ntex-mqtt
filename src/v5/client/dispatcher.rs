@@ -161,7 +161,7 @@ where
 
                         // check for duplicated packet id
                         if !inner.inflight.insert(pid) {
-                            let _ = self.inner.sink.send(codec::Packet::PublishAck(
+                            self.inner.sink.send(codec::Packet::PublishAck(
                                 codec::PublishAck {
                                     packet_id: pid,
                                     reason_code: codec::PublishAckReason::PacketIdentifierInUse,
@@ -364,6 +364,7 @@ where
                     Poll::Pending => return Poll::Pending,
                 };
                 if let Some(id) = NonZeroU16::new(*this.packet_id) {
+                    log::trace!("Sending publish ack for {} id", this.packet_id);
                     this.inner.info.borrow_mut().inflight.remove(&id);
                     let ack = codec::PublishAck {
                         packet_id: id,
@@ -453,7 +454,7 @@ where
 
         if self.error {
             if let Some(pkt) = result.packet {
-                let _ = self.inner.sink.send(pkt);
+                self.inner.sink.send(pkt)
             }
             if result.disconnect {
                 self.inner.sink.drop_sink();

@@ -2,10 +2,10 @@ use ntex::util::ByteString;
 use std::{marker::PhantomData, num::NonZeroU16};
 
 use super::codec;
-use crate::types::QoS;
+use crate::{error, types::QoS};
 
 #[derive(Debug)]
-pub enum ControlMessage {
+pub enum ControlMessage<E> {
     /// Ping packet
     Ping(Ping),
     /// Disconnect packet
@@ -16,6 +16,10 @@ pub enum ControlMessage {
     Unsubscribe(Unsubscribe),
     /// Connection dropped
     Closed(Closed),
+    /// Service level error
+    Error(Error<E>),
+    /// Protocol level error
+    ProtocolError(ProtocolError),
 }
 
 #[derive(Debug)]
@@ -34,7 +38,7 @@ pub(crate) enum ControlResultKind {
     Closed,
 }
 
-impl ControlMessage {
+impl<E> ControlMessage<E> {
     pub(crate) fn ping() -> Self {
         ControlMessage::Ping(Ping)
     }
@@ -45,6 +49,14 @@ impl ControlMessage {
 
     pub(crate) fn closed(is_error: bool) -> Self {
         ControlMessage::Closed(Closed::new(is_error))
+    }
+
+    pub(super) fn error(err: E) -> Self {
+        ControlMessage::Error(Error::new(err))
+    }
+
+    pub(super) fn proto_error(err: error::ProtocolError) -> Self {
+        ControlMessage::ProtocolError(ProtocolError::new(err))
     }
 
     pub fn disconnect(&self) -> ControlResult {
@@ -70,6 +82,66 @@ impl Disconnect {
     }
 }
 
+/// Service level error
+#[derive(Debug)]
+pub struct Error<E> {
+    err: E,
+}
+
+impl<E> Error<E> {
+    pub fn new(err: E) -> Self {
+        Self { err }
+    }
+
+    #[inline]
+    /// Returns reference to mqtt error
+    pub fn get_ref(&self) -> &E {
+        &self.err
+    }
+
+    #[inline]
+    /// Ack service error, return disconnect packet and close connection.
+    pub fn ack(self) -> ControlResult {
+        ControlResult { result: ControlResultKind::Disconnect }
+    }
+
+    #[inline]
+    /// Ack service error, return disconnect packet and close connection.
+    pub fn ack_and_error(self) -> (ControlResult, E) {
+        (ControlResult { result: ControlResultKind::Disconnect }, self.err)
+    }
+}
+
+/// Protocol level error
+#[derive(Debug)]
+pub struct ProtocolError {
+    err: error::ProtocolError,
+}
+
+impl ProtocolError {
+    pub fn new(err: error::ProtocolError) -> Self {
+        Self { err }
+    }
+
+    #[inline]
+    /// Returns reference to a protocol error
+    pub fn get_ref(&self) -> &error::ProtocolError {
+        &self.err
+    }
+
+    #[inline]
+    /// Ack protocol error, return disconnect packet and close connection.
+    pub fn ack(self) -> ControlResult {
+        ControlResult { result: ControlResultKind::Disconnect }
+    }
+
+    #[inline]
+    /// Ack protocol error, return disconnect packet and close connection.
+    pub fn ack_and_error(self) -> (ControlResult, error::ProtocolError) {
+        (ControlResult { result: ControlResultKind::Disconnect }, self.err)
+    }
+}
+
 /// Subscribe message
 #[derive(Debug)]
 pub struct Subscribe {
@@ -90,7 +162,7 @@ impl Subscribe {
         let mut codes = Vec::with_capacity(topics.len());
         (0..topics.len()).for_each(|_| codes.push(codec::SubscribeReturnCode::Failure));
 
-        Self { topics, codes, packet_id }
+        Self { packet_id, topics, codes }
     }
 
     #[inline]
@@ -166,7 +238,7 @@ impl<'a> Subscription<'a> {
     #[inline]
     /// subscription topic
     pub fn topic(&self) -> &'a ByteString {
-        &self.topic
+        self.topic
     }
 
     #[inline]
@@ -210,7 +282,7 @@ pub(crate) struct UnsubscribeResult {
 
 impl Unsubscribe {
     pub(crate) fn new(packet_id: NonZeroU16, topics: Vec<ByteString>) -> Self {
-        Self { topics, packet_id }
+        Self { packet_id, topics }
     }
 
     /// returns iterator over unsubscribe topics
